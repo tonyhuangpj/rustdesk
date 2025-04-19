@@ -21,11 +21,12 @@ use hbb_common::{
 };
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{
         atomic::{AtomicI32, Ordering},
         Arc,
     },
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 pub type SessionID = uuid::Uuid;
@@ -2417,8 +2418,28 @@ pub fn main_get_common(key: String) -> String {
         return false.to_string();
     } else if key == "transfer-job-id" {
         return hbb_common::fs::get_next_job_id().to_string();
+    } else if key == "is-msi-installed" {
+        #[cfg(target_os = "windows")]
+        {
+            return match crate::platform::windows::is_msi_installed() {
+                Ok(r) => r.to_string(),
+                Err(e) => e.to_string(),
+            };
+        }
+        #[cfg(not(target_os = "windows"))]
+        return false.to_string();
     } else {
-        "".to_owned()
+        if key.starts_with("download-data-") {
+            let id = key.replace("download-data-", "");
+            match crate::hbbs_http::downloader::get_download_data(&id) {
+                Ok(data) => serde_json::to_string(&data).unwrap_or_default(),
+                Err(e) => {
+                    format!("error:{}", e)
+                }
+            }
+        } else {
+            "".to_owned()
+        }
     }
 }
 
@@ -2448,6 +2469,60 @@ pub fn main_set_common(_key: String, _value: String) {
                 serde_json::ser::to_string(&data).unwrap_or("".to_owned()),
             );
         });
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use crate::updater::get_download_file_from_url;
+        if _key == "download-new-version" {
+            let download_url = _value.clone();
+            let event_key = "download-new-version".to_owned();
+            let data = if let Some(download_file) = get_download_file_from_url(&download_url) {
+                std::fs::remove_file(&download_file).ok();
+                match crate::hbbs_http::downloader::download_file(
+                    download_url,
+                    Some(PathBuf::from(download_file)),
+                    Some(Duration::from_secs(3)),
+                ) {
+                    Ok(id) => HashMap::from([("name", event_key), ("id", id)]),
+                    Err(e) => HashMap::from([("name", event_key), ("error", e.to_string())]),
+                }
+            } else {
+                HashMap::from([
+                    ("name", event_key),
+                    ("error", "Invalid download url".to_string()),
+                ])
+            };
+            let _res = flutter::push_global_event(
+                flutter::APP_TYPE_MAIN,
+                serde_json::ser::to_string(&data).unwrap_or("".to_owned()),
+            );
+        } else if _key == "update-me" {
+            if let Some(new_version_file) = get_download_file_from_url(&_value) {
+                if let Some(f) = new_version_file.to_str() {
+                    if f.ends_with(".exe") {
+                        // 1.3.9 does not support "--update"
+                        // But we can assume that the new version supports it.
+                        if let Err(e) =
+                            crate::platform::run_exe_in_cur_session(f, vec!["--update"], false)
+                        {
+                            log::error!("Failed to run the update exe: {}", e);
+                        }
+                    } else if f.ends_with(".msi") {
+                        if let Err(e) = crate::platform::update_me_msi(f) {
+                            log::error!("Failed to run the update msi: {}", e);
+                        }
+                    } else {
+                        // unreachable!()
+                    }
+                }
+            }
+        }
+    }
+
+    if _key == "remove-downloader" {
+        crate::hbbs_http::downloader::remove(&_value);
+    } else if _key == "cancel-downloader" {
+        crate::hbbs_http::downloader::cancel(&_value);
     }
 }
 
